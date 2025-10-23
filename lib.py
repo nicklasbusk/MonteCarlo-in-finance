@@ -59,27 +59,6 @@ class MonteCarloSimulation:
         avg = S[:, 1:].mean(axis=1)
         return np.exp(-self.r * self.T) * np.maximum(avg - self.K, 0.0)
 
-    def diagnose_once(self, Z, euler=True, beta_fixed=None):
-        # Target X
-        X = self._cev_arith_from_Z(Z, euler)
-        # Control Y (your GBM routine returns pathwise payoffs already)
-        Y = self.sim_GBM_paths(Z.shape[0], Z)
-        muY = self.geometric_asian_closed_form()
-
-        if beta_fixed is None:
-            Xc, Yc = X - X.mean(), Y - Y.mean()
-            varY = Yc.var(ddof=1); beta = 0.0 if varY == 0 else (np.cov(X, Y, ddof=1)[0,1] / varY)
-        else:
-            beta = float(beta_fixed)
-
-        adj = X + beta*(muY - Y)
-        corr = float(np.corrcoef(X, Y)[0,1])
-        vr = float(1.0 - adj.var(ddof=1) / X.var(ddof=1))  # variance reduction fraction
-        return {"corr_XY": corr, "beta": float(beta), "VR_fraction": vr,
-                "SE_plain": float(X.std(ddof=1)/np.sqrt(X.size)),
-                "SE_cv": float(adj.std(ddof=1)/np.sqrt(X.size))}
-
-
     def sim_GBM_paths(self, N, Z):
         """Simulate Geometric Brownian Motion paths."""
         drift = (self.r - 0.5 * self.sigma**2) * self.dt
@@ -137,6 +116,38 @@ class MonteCarloSimulation:
         avg = S[:, 1:].mean(axis=1)
         disc_payoff = np.exp(-self.r * self.T) * np.maximum(avg - self.K, 0.0)
         return float(disc_payoff.mean())
+    
+
+    def _payoffs_from_Z_with_params(self, Z, euler=True, S0_override=None, sigma_override=None):
+        """
+        Return discounted payoffs vector for CEV Asian call using Z and optional
+        parameter overrides for S0 and sigma.
+        """
+        N = Z.shape[0]
+        S0 = self.S0 if S0_override is None else float(S0_override)
+        sigma = self.sigma if sigma_override is None else float(sigma_override)
+
+        # Simulate paths with local params (copy of sim_CEV_paths using overrides)
+        logS = np.empty((N, self.M+1), dtype=float)
+        logS[:, 0] = np.log(S0)
+
+        for n in range(self.M):
+            logS_n = logS[:, n]
+            S_n = np.exp(logS_n)
+            dW = self.sqrt_dt * Z[:, n]
+            drift = (self.r - 0.5 * sigma**2 * np.power(S_n, 2*self.gamma-2)) * self.dt
+            diffusion = sigma * np.power(S_n, self.gamma-1) * dW
+
+            if euler:
+                logS[:, n+1] = logS_n + drift + diffusion
+            else:
+                correction = 0.5 * sigma**2 * (self.gamma - 1) * np.power(S_n, 2*self.gamma-2) * (dW**2 - self.dt)
+                logS[:, n+1] = logS_n + drift + diffusion + correction
+
+        S = np.exp(logS)
+        arith_avg = S[:, 1:].mean(axis=1)
+        return np.exp(-self.r * self.T) * np.maximum(arith_avg - self.K, 0.0)
+
 
     def price_asian_option_cv_from_Z(self, Z, euler=True, beta_fixed=None):
         """
@@ -171,24 +182,36 @@ class MonteCarloSimulation:
         price = float(adj.mean())        
         return price
 
-    def estimate_beta_pilot(self, Npilot, seed=None, euler=True):
-        """
-        Small IID MC pilot to get a fixed beta for RQMC.
-        """
-        seed = self.base_seed + 987654 if seed is None else seed
-        Zp = self.draw_pseudo_random_numbers(seed, Npilot, self.M)
-        N = Npilot
 
-        # Build X and Y on the same Z
-        S_cev = self.sim_CEV_paths(N, Zp, euler=euler)
-        X = np.exp(-self.r * self.T) * np.maximum(S_cev[:,1:].mean(axis=1) - self.K, 0.0)
-        Y = self.sim_GBM_paths(N, Zp)
-        Xc, Yc = X - X.mean(), Y - Y.mean()
-        varY = Yc.var(ddof=1)
-        if varY == 0:
-            return 0.0
-        covXY = (Xc*Yc).mean() * N / max(N-1,1)
-        return float(covXY / varY)
+    def estimate_beta_pilot_rqmc(self, Npilot, scrambles=4, euler=True, pilot_seed_offset=100000):
+        """Estimate a fixed beta using independent RQMC scrambles.
+
+        This runs `scrambles` independent RQMC pilots (each with Npilot points) using
+        seeds offset by `pilot_seed_offset` and returns the average beta. Use this
+        beta as a fixed control-variate coefficient for production RQMC runs.
+
+        Args:
+            Npilot (int): number of pilot points per scramble (power of 2)
+            scrambles (int): number of independent pilot scrambles to average over
+            euler (bool): whether to use Euler scheme for CEV paths
+            pilot_seed_offset (int): offset added to self.base_seed to ensure pilots
+        Returns:
+            float: average beta over pilot scrambles
+        """
+        betas = []
+        for s in range(scrambles):
+            seed = self.base_seed + pilot_seed_offset + s
+            Z = self.draw_quasi_random_numbers(seed, Npilot, self.M)
+            # Build X, Y on the SAME Z
+            S_cev = self.sim_CEV_paths(Npilot, Z, euler=euler)
+            X = np.exp(-self.r*self.T)*np.maximum(S_cev[:,1:].mean(1)-self.K, 0.0)
+            Y = self.sim_GBM_paths(Npilot, Z)
+            Xc, Yc = X - X.mean(), Y - Y.mean()
+            denom = (Yc**2).sum()
+            beta_s = (Xc*Yc).sum() / denom
+            betas.append(beta_s)
+        return float(np.mean(betas))
+
 
     @staticmethod
     def ci_from_replicates(estimates, alpha=0.05):
@@ -207,19 +230,48 @@ class MonteCarloSimulation:
             ci = (np.nan, np.nan)
         return mean, se_mean, ci, var_between
 
-    def rqmc_with_scrambles(self, N, scrambles, euler=True, CV=False, beta_fixed=None, pilot_N=16384, pilot_seed=None):
-        """Run RQMC with multiple scrambles."""
-        if beta_fixed is None:
-            beta_fixed = self.estimate_beta_pilot(pilot_N, seed=pilot_seed, euler=euler)
+    def rqmc_with_scrambles(self, N, scrambles, euler=True, CV=False, beta_fixed=None,
+                            pilot_N=16384, pilot_scrambles=4, pilot_seed_offset=100000):
+        """Run RQMC with multiple scrambles.
+
+        If CV=True and beta_fixed is None, this method will first run a separate
+        pilot procedure (using `pilot_scrambles` independent scrambles of size
+        `pilot_N`) to estimate a fixed beta via `estimate_beta_pilot_rqmc`. The
+        pilot scrambles use a seed offset so they are independent from the
+        production scrambles. The fixed beta is then applied to every production
+        scramble, avoiding in-sample beta estimation that can increase variance
+        under RQMC.
+
+        Args:
+            N (int): number of points per production scramble (power of 2)
+            scrambles (int): number of production scrambles
+            euler (bool): whether to use Euler scheme
+            CV (bool): whether to apply control variates
+            beta_fixed (float or None): if provided, use this beta directly
+            pilot_N (int): number of pilot points per pilot scramble
+            pilot_scrambles (int): number of pilot scrambles to average beta over
+            pilot_seed_offset (int): offset added to base_seed for pilot scrambles
+        Returns:
+            tuple: (mean, se, ci, var_between, estimates_array)
+        """
+
+        # If CV requested but no fixed beta provided, estimate pilot beta once
+        if CV and beta_fixed is None:
+            beta_fixed = self.estimate_beta_pilot_rqmc(pilot_N, scrambles=pilot_scrambles,
+                                                     euler=euler, pilot_seed_offset=pilot_seed_offset)
+            print(f"Estimated fixed beta from pilot RQMC: {beta_fixed:.6f}")
 
         estimates = []
         for s in range(scrambles):
-            Z = self.draw_quasi_random_numbers(self.base_seed + s, N, self.M)
+            seed = self.base_seed + s
+            Z = self.draw_quasi_random_numbers(seed, N, self.M)
             if not CV:
                 estimates.append(self.price_asian_option_from_Z(Z, euler))
             else:
                 estimates.append(self.price_asian_option_cv_from_Z(Z, euler, beta_fixed=beta_fixed))
-        return self.ci_from_replicates(estimates)
+
+        mean, se, ci, var_between = self.ci_from_replicates(estimates)
+        return mean, se, ci, var_between
 
     def mc_with_batches(self, N, batches, euler=True, CV=False):
         """Run standard MC with multiple batches."""
@@ -305,22 +357,123 @@ class MonteCarloSimulation:
         prices = []
         
         method_map = {
-            'mc': self.mc_with_batches,
-            'mc + antithetic': self.mc_with_antithetic,
-            'mc + cv': self.mc_with_batches(N, batches, euler, CV=True),
-            'mc + cv + antithetic': self.mc_with_antithetic(N, batches, euler, CV=True),
-            'qmc': self.rqmc_with_scrambles,
-            'qmc + cv': self.rqmc_with_scrambles(N, batches, euler, CV=True)
+            'mc': (self.mc_with_batches, False),
+            'antithetic': (self.mc_with_antithetic, False),
+            'mc + cv': (self.mc_with_batches, True),
+            'mc + cv + antithetic': (self.mc_with_antithetic, True),
+            'qmc': (self.rqmc_with_scrambles, False),
+            'qmc + cv': (self.rqmc_with_scrambles, True),
         }
-        
+
         if method not in method_map:
             raise ValueError(f"Method must be one of {list(method_map.keys())}")
-            
-        simulation_method = method_map[method]
-        
+
+        func, cv_flag = method_map[method]
+
         for N in N_values:
-            mean, se, _, _ = simulation_method(N, batches, euler)
+            mean, se, _, _ = func(N, batches, euler, CV=cv_flag)
             prices.append(mean)
             errors.append(se)
-            
+
         return prices, errors
+    
+
+    def delta_from_Z_fd(self, Z, euler=True, rel_bump=0.001, scheme="central"):
+        """
+        Finite difference approximation of Delta (dPrice/dS0) using common random numbers.
+        Returns (mean, SE, pathwise_estimates).
+        """
+        h = max(rel_bump * self.S0, 1e-12)
+        if scheme == "central":
+            up = self._payoffs_from_Z_with_params(Z, euler=euler, S0_override=self.S0 + h)
+            dn = self._payoffs_from_Z_with_params(Z, euler=euler, S0_override=self.S0 - h)
+            g = (up - dn) / (2.0 * h)
+        elif scheme == "forward":
+            up = self._payoffs_from_Z_with_params(Z, euler=euler, S0_override=self.S0 + h)
+            base = self._payoffs_from_Z_with_params(Z, euler=euler, S0_override=self.S0)
+            g = (up - base) / h
+        else:
+            raise ValueError("scheme must be 'central' or 'forward'")
+        delta_mean = float(g.mean())
+        delta_se = float(g.std(ddof=1) / np.sqrt(g.size))
+        return delta_mean, delta_se, g
+
+    def vega_from_Z_fd(self, Z, euler=True, abs_bump=0.001, scheme="central"):
+        """
+        Finite difference approximation of Vega (dPrice/dsigma) using common random numbers.
+        Returns (mean, SE, pathwise_estimates).
+        """
+        h = max(abs_bump, 1e-12)
+        if scheme == "central":
+            up = self._payoffs_from_Z_with_params(Z, euler=euler, sigma_override=self.sigma + h)
+            dn = self._payoffs_from_Z_with_params(Z, euler=euler, sigma_override=self.sigma - h)
+            g = (up - dn) / (2.0 * h)
+        elif scheme == "forward":
+            up = self._payoffs_from_Z_with_params(Z, euler=euler, sigma_override=self.sigma + h)
+            base = self._payoffs_from_Z_with_params(Z, euler=euler, sigma_override=self.sigma)
+            g = (up - base) / h
+        else:
+            raise ValueError("scheme must be 'central' or 'forward'")
+        vega_mean = float(g.mean())
+        vega_se = float(g.std(ddof=1) / np.sqrt(g.size))
+        return vega_mean, vega_se, g
+
+    def mc_greeks_with_batches(self, N, batches=8, euler=True, rel_bump=0.001, abs_bump=0.001):
+        """
+        Compute Greeks using MC with multiple batches, using CRN within each batch.
+        Returns tuples for Delta and Vega: (mean, SE, CI, var_between, replicate_means)
+        where replicate_means has length == batches.
+        """
+        delta_repl = []
+        vega_repl = []
+        for b in range(batches):
+            Z = self.draw_pseudo_random_numbers(self.base_seed + b, N, self.M)
+            d_mean, _, _  = self.delta_from_Z_fd(Z, euler=euler, rel_bump=rel_bump, scheme="central")
+            v_mean,  _, _  = self.vega_from_Z_fd(Z, euler=euler, abs_bump=abs_bump, scheme="central")
+            delta_repl.append(d_mean)
+            vega_repl.append(v_mean)
+
+        d_mean, d_se, d_ci, d_var_between = self.ci_from_replicates(delta_repl)
+        v_mean, v_se, v_ci, v_var_between = self.ci_from_replicates(vega_repl)
+
+        return (
+            d_mean, d_se, d_ci, d_var_between, np.asarray(delta_repl, dtype=float)
+        ), (
+            v_mean, v_se, v_ci, v_var_between, np.asarray(vega_repl, dtype=float)
+        )
+
+    def rqmc_greeks_with_scrambles(self, N, scrambles=8, euler=True, rel_bump=0.001, abs_bump=0.001):
+        """
+        Compute Greeks using RQMC with multiple Owen-scrambled Sobol replications.
+        Returns tuples for Delta and Vega: (mean, SE, CI, var_between, replicate_means)
+        """
+        delta_repl = []
+        vega_repl = []
+        for s in range(scrambles):
+            Z = self.draw_quasi_random_numbers(self.base_seed + s, N, self.M)
+            d_mean, _,_  = self.delta_from_Z_fd(Z, euler=euler, rel_bump=rel_bump, scheme="central")
+            v_mean, _, _  = self.vega_from_Z_fd(Z, euler=euler, abs_bump=abs_bump, scheme="central")
+            delta_repl.append(d_mean)
+            vega_repl.append(v_mean)
+
+        d_mean, d_se, d_ci, d_var_between = self.ci_from_replicates(delta_repl)
+        v_mean, v_se, v_ci, v_var_between = self.ci_from_replicates(vega_repl)
+        return (
+            d_mean, d_se, d_ci, d_var_between, np.asarray(delta_repl, dtype=float)
+        ), (
+            v_mean, v_se, v_ci, v_var_between, np.asarray(vega_repl, dtype=float)
+        )
+    def compare_greeks_methods(self, N, batches=8, euler=True):
+        """Compare different methods for estimating Greeks."""
+        # Standard MC
+        mc_delta, mc_vega = self.mc_greeks_with_batches(N, batches, euler)
+
+        # RQMC
+        rqmc_delta, rqmc_vega = self.rqmc_greeks_with_scrambles(N, batches, euler)
+
+        results = {
+            'Standard MC': {'Delta': mc_delta, 'Vega': mc_vega},
+            'RQMC': {'Delta': rqmc_delta, 'Vega': rqmc_vega}
+        }
+
+        return results
