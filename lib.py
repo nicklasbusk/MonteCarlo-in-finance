@@ -182,22 +182,36 @@ class MonteCarloSimulation:
 
     def sim_CEV_paths(self, N, Z, euler=True):
         """Simulate CEV model paths."""
+        # Recompute dt/sqrt_dt in case self.M was changed externally
+        dt = self.T / self.M
+        sqrt_dt = np.sqrt(dt)
+
         logS = np.empty((N, self.M+1), dtype=float)
         logS[:, 0] = np.log(self.S0)
+
+        # Small floor to avoid taking powers of zero which can produce inf/nan
+        S_floor = 1e-16
 
         for n in range(self.M):
             logS_n = logS[:, n]
             S_n = np.exp(logS_n)
-            dW = self.sqrt_dt * Z[:, n]
-            drift = (self.r - 0.5 * self.sigma**2 * np.power(S_n, 2*self.gamma-2)) * self.dt
-            diffusion = self.sigma * np.power(S_n, self.gamma-1) * dW
-            
+            # apply floor to S_n for numerical stability in power operations
+            S_n_safe = np.maximum(S_n, S_floor)
+            dW = sqrt_dt * Z[:, n]
+
+            # compute powers using the safe S_n
+            pow_term = np.power(S_n_safe, 2*self.gamma-2)
+            pow_term_diff = np.power(S_n_safe, self.gamma-1)
+
+            drift = (self.r - 0.5 * self.sigma**2 * pow_term) * dt
+            diffusion = self.sigma * pow_term_diff * dW
+
             if euler:
                 logS[:, n+1] = logS_n + drift + diffusion
             else:
-                correction = 0.5 * self.sigma**2 * (self.gamma - 1) * np.power(S_n, 2*self.gamma-2) * (dW**2 - self.dt)
+                correction = 0.5 * self.sigma**2 * (self.gamma - 1) * pow_term * (dW**2 - dt)
                 logS[:, n+1] = logS_n + drift + diffusion + correction
-                
+
         return np.exp(logS)
 
     def price_asian_option_from_Z(self, Z, euler=True):
@@ -208,6 +222,13 @@ class MonteCarloSimulation:
         disc_payoff = np.exp(-self.r * self.T) * np.maximum(avg - self.K, 0.0)
         return float(disc_payoff.mean())
     
+    def price_asian_option_from_Z_raw(self, Z, euler=True):
+        """Price Asian option using provided random numbers."""
+        N = Z.shape[0]
+        S = self.sim_CEV_paths(N, Z, euler=euler)
+        avg = S[:, 1:].mean(axis=1)
+        disc_payoff = np.exp(-self.r * self.T) * np.maximum(avg - self.K, 0.0)
+        return disc_payoff
 
     def _payoffs_from_Z_with_params(self, Z, euler=True, S0_override=None, sigma_override=None):
         """
@@ -222,22 +243,35 @@ class MonteCarloSimulation:
         logS = np.empty((N, self.M+1), dtype=float)
         logS[:, 0] = np.log(S0)
 
+        # Recompute dt/sqrt_dt in case self.M was changed externally
+        dt = self.T / self.M
+        sqrt_dt = np.sqrt(dt)
+
+        # Small floor to avoid taking powers of zero
+        S_floor = 1e-16
+
         for n in range(self.M):
             logS_n = logS[:, n]
             S_n = np.exp(logS_n)
-            dW = self.sqrt_dt * Z[:, n]
-            drift = (self.r - 0.5 * sigma**2 * np.power(S_n, 2*self.gamma-2)) * self.dt
-            diffusion = sigma * np.power(S_n, self.gamma-1) * dW
+            S_n_safe = np.maximum(S_n, S_floor)
+            dW = sqrt_dt * Z[:, n]
+
+            pow_term = np.power(S_n_safe, 2*self.gamma-2)
+            pow_term_diff = np.power(S_n_safe, self.gamma-1)
+
+            drift = (self.r - 0.5 * sigma**2 * pow_term) * dt
+            diffusion = sigma * pow_term_diff * dW
 
             if euler:
                 logS[:, n+1] = logS_n + drift + diffusion
             else:
-                correction = 0.5 * sigma**2 * (self.gamma - 1) * np.power(S_n, 2*self.gamma-2) * (dW**2 - self.dt)
+                correction = 0.5 * sigma**2 * (self.gamma - 1) * pow_term * (dW**2 - dt)
                 logS[:, n+1] = logS_n + drift + diffusion + correction
 
         S = np.exp(logS)
         arith_avg = S[:, 1:].mean(axis=1)
         return np.exp(-self.r * self.T) * np.maximum(arith_avg - self.K, 0.0)
+
 
 
     def price_asian_option_cv_from_Z(self, Z, euler=True, beta_fixed=None):
