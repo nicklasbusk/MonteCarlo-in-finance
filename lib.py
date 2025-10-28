@@ -45,6 +45,97 @@ class MonteCarloSimulation:
         U = sobol_engine.random_base2(m=m)
         return norm.ppf(np.clip(U, 1e-12, 1-1e-12))
 
+    def draw_quasi_random_numbers_bb(self, seed, N, M):
+        """Generate quasi-random numbers using Sobol + Brownian bridge.
+
+        This returns an (N, M) array of standard normals corresponding to
+        Brownian increments in time order (so they can be used directly as Z
+        in the existing simulation routines where dW = sqrt(dt) * Z[:, n]).
+
+        The routine takes Sobol points -> normal variates -> Brownian bridge
+        construction (dyadic mid-point order). The mapping is vectorized over
+        the N paths.
+        """
+        # Generate standard normal variates from scrambled Sobol
+        m = int(np.ceil(np.log2(N)))
+        if 2**m != N:
+            raise ValueError("For Sobol QMC, set N to 2**m.")
+        sobol_engine = Sobol(d=M, scramble=True, seed=seed)
+        U = sobol_engine.random_base2(m=m)
+        Z_std = norm.ppf(np.clip(U, 1e-12, 1-1e-12))  # shape (N, M)
+
+        # Brownian-bridge mapping: map independent normals Z_std to samples of
+        # W(t1..tM) in dyadic (midpoint) order then convert to increments dW
+        Np = N
+        dt = self.dt
+        sqrt_dt = self.sqrt_dt
+        Mloc = M
+
+        # times are at multiples of dt: t_i = i*dt for i=1..M
+        # We'll work with indices 0..M (0 = time 0, M = time T). The sampled
+        # values array has length M+1, with known W(0)=0 and W(T) from Z_std[:,0].
+
+        # Build dyadic midpoint sampling order (excluding endpoints)
+        order = []
+        def rec(l, r):
+            if r - l <= 1:
+                return
+            midx = (l + r) // 2
+            order.append(midx)
+            rec(l, midx)
+            rec(midx, r)
+        rec(0, Mloc)
+
+        # Prepare sampled values container: shape (N, M+1)
+        sampled = np.empty((Np, Mloc+1), dtype=float)
+        sampled.fill(np.nan)
+        sampled[:, 0] = 0.0
+
+        # First normal (first column) -> W(T)
+        sampled[:, Mloc] = Z_std[:, 0] * np.sqrt(self.T)
+
+        # Fill remaining points in the dyadic order using subsequent columns of Z_std
+        z_col = 1
+        for mpos in order:
+            # left and right boundaries are nearest integer indices with non-nan values
+            # find l < mpos with sampled[:, l] not nan and r > mpos similarly
+            # vectorized search using boolean masks per path would be heavy; instead
+            # we use the fact that sampled values are the same pattern across paths
+            # (we fill global positions), so we can find l and r scalars.
+            # Because we fill in dyadic order, the nearest filled neighbors are the
+            # previous split endpoints for all paths.
+            # Find left boundary
+            l = mpos - 1
+            while l >= 0 and np.isnan(sampled[0, l]):
+                l -= 1
+            r = mpos + 1
+            while r <= Mloc and np.isnan(sampled[0, r]):
+                r += 1
+
+            # Now l and r are scalar indices with sampled values present
+            tl = l * dt
+            tr = r * dt
+            tm = mpos * dt
+
+            # conditional mean and variance for Brownian bridge
+            # mean = ( (r-m)*W(l) + (m-l)*W(r) ) / (r-l)
+            # var  = (m-l)*(r-m)/(r-l) * dt
+            denom = float(r - l)
+            mean = (sampled[:, l] * (r - mpos) + sampled[:, r] * (mpos - l)) / denom
+            var = ( (mpos - l) * (r - mpos) / denom ) * dt
+            sd = np.sqrt(max(var, 0.0))
+
+            sampled[:, mpos] = mean + Z_std[:, z_col] * sd
+            z_col += 1
+
+        # Now convert sampled W values (positions 1..M) into increments dW
+        Wvals = sampled[:, 1:]
+        Wprev = np.concatenate([np.zeros((Np, 1), dtype=float), Wvals[:, :-1]], axis=1)
+        dW = Wvals - Wprev
+        # convert to standard-normal increments Z such that dW = sqrt(dt) * Z
+        Z_increments = dW / sqrt_dt
+        return Z_increments
+
     def draw_pseudo_antithetic_numbers(self, seed, N, M):
         """Generate antithetic pairs of random numbers."""
         rng = np.random.default_rng(seed)
@@ -183,7 +274,7 @@ class MonteCarloSimulation:
         return price
 
 
-    def estimate_beta_pilot_rqmc(self, Npilot, scrambles=4, euler=True, pilot_seed_offset=100000):
+    def estimate_beta_pilot_rqmc(self, Npilot, scrambles=4, euler=True, pilot_seed_offset=100000, use_bb=False):
         """Estimate a fixed beta using independent RQMC scrambles.
 
         This runs `scrambles` independent RQMC pilots (each with Npilot points) using
@@ -201,7 +292,11 @@ class MonteCarloSimulation:
         betas = []
         for s in range(scrambles):
             seed = self.base_seed + pilot_seed_offset + s
-            Z = self.draw_quasi_random_numbers(seed, Npilot, self.M)
+            # choose QMC generator (plain or Brownian-bridge)
+            if use_bb:
+                Z = self.draw_quasi_random_numbers_bb(seed, Npilot, self.M)
+            else:
+                Z = self.draw_quasi_random_numbers(seed, Npilot, self.M)
             # Build X, Y on the SAME Z
             S_cev = self.sim_CEV_paths(Npilot, Z, euler=euler)
             X = np.exp(-self.r*self.T)*np.maximum(S_cev[:,1:].mean(1)-self.K, 0.0)
@@ -231,7 +326,8 @@ class MonteCarloSimulation:
         return mean, se_mean, ci, var_between
 
     def rqmc_with_scrambles(self, N, scrambles, euler=True, CV=False, beta_fixed=None,
-                            pilot_N=16384, pilot_scrambles=4, pilot_seed_offset=100000):
+                            pilot_N=16384, pilot_scrambles=4, pilot_seed_offset=100000,
+                            use_bb=False):
         """Run RQMC with multiple scrambles.
 
         If CV=True and beta_fixed is None, this method will first run a separate
@@ -264,7 +360,10 @@ class MonteCarloSimulation:
         estimates = []
         for s in range(scrambles):
             seed = self.base_seed + s
-            Z = self.draw_quasi_random_numbers(seed, N, self.M)
+            if use_bb:
+                Z = self.draw_quasi_random_numbers_bb(seed, N, self.M)
+            else:
+                Z = self.draw_quasi_random_numbers(seed, N, self.M)
             if not CV:
                 estimates.append(self.price_asian_option_from_Z(Z, euler))
             else:
@@ -336,8 +435,14 @@ class MonteCarloSimulation:
         mc_cv_mean, mc_cv_se, mc_cv_ci, mc_cv_var = self.mc_with_batches(N, batches, euler, CV=True)
         # MC + CV + Antithetic
         mc_cv_anti_mean, mc_cv_anti_se, mc_cv_anti_ci, mc_cv_anti_var = self.mc_with_antithetic(N, batches, euler, CV=True)
-        # CV RQMC
+
+        # RQMC + BB
+        qmc_bb_mean, qmc_bb_se, qmc_bb_ci, qmc_bb_var = self.rqmc_with_scrambles(N, batches, euler, CV=False, use_bb=True)    
+
+        # RQMC + CV
         qmc_cv_mean, qmc_cv_se, qmc_cv_ci, qmc_cv_var = self.rqmc_with_scrambles(N, batches, euler, CV=True)
+        # RQMC + CB + CV
+        qmc_cv_bb_mean, qmc_cv_bb_se, qmc_cv_bb_ci, qmc_cv_bb_var = self.rqmc_with_scrambles(N, batches, euler, CV=True, use_bb=True)
 
 
         results = {
@@ -346,7 +451,9 @@ class MonteCarloSimulation:
             'Standard MC + CV': {'mean': mc_cv_mean, 'SE': mc_cv_se, 'CI': mc_cv_ci, 'var': mc_cv_var},
             'Standard MC + CV + Antithetic': {'mean': mc_cv_anti_mean, 'SE': mc_cv_anti_se, 'CI': mc_cv_anti_ci, 'var': mc_cv_anti_var},
             'RQMC': {'mean': qmc_mean, 'SE': qmc_se, 'CI': qmc_ci, 'var': qmc_var},
-            'RQMC + CV': {'mean': qmc_cv_mean, 'SE': qmc_cv_se, 'CI': qmc_cv_ci, 'var': qmc_cv_var}
+            'RQMC + CV': {'mean': qmc_cv_mean, 'SE': qmc_cv_se, 'CI': qmc_cv_ci, 'var': qmc_cv_var},
+            'RQMC + BB': {'mean': qmc_bb_mean, 'SE': qmc_bb_se, 'CI': qmc_bb_ci, 'var': qmc_bb_var},
+            'RQMC + BB + CV': {'mean': qmc_cv_bb_mean, 'SE': qmc_cv_bb_se, 'CI': qmc_cv_bb_ci, 'var': qmc_cv_bb_var}
         }
     
         return results
@@ -362,7 +469,7 @@ class MonteCarloSimulation:
             'mc + cv': (self.mc_with_batches, True),
             'mc + cv + antithetic': (self.mc_with_antithetic, True),
             'qmc': (self.rqmc_with_scrambles, False),
-            'qmc + cv': (self.rqmc_with_scrambles, True),
+            'qmc + cv': (self.rqmc_with_scrambles, True)
         }
 
         if method not in method_map:
@@ -450,7 +557,12 @@ class MonteCarloSimulation:
         delta_repl = []
         vega_repl = []
         for s in range(scrambles):
-            Z = self.draw_quasi_random_numbers(self.base_seed + s, N, self.M)
+            seed = self.base_seed + s
+            # draw using either plain Sobol->normal or Sobol+Brownian-bridge
+            if getattr(self, '_rqmc_use_bb', False):
+                Z = self.draw_quasi_random_numbers_bb(seed, N, self.M)
+            else:
+                Z = self.draw_quasi_random_numbers(seed, N, self.M)
             d_mean, _,_  = self.delta_from_Z_fd(Z, euler=euler, rel_bump=rel_bump, scheme="central")
             v_mean, _, _  = self.vega_from_Z_fd(Z, euler=euler, abs_bump=abs_bump, scheme="central")
             delta_repl.append(d_mean)
