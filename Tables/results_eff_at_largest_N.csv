@@ -1,0 +1,15 @@
+\begin{tabular}{lrr}
+\toprule
+ & Eff_last & Eff_rel_to_MC \\
+Method &  &  \\
+\midrule
+MC & 0.007020 & 1.000000 \\
+MC + Antithetic & 0.002659 & 0.378792 \\
+MC + CV & 0.000030 & 0.004263 \\
+MC + CV + Antithetic & 0.000023 & 0.003244 \\
+RQMC & 0.000002 & 0.000253 \\
+RQMC + Antithetic & 0.000008 & 0.001089 \\
+RQMC + CV & 0.000001 & 0.000085 \\
+RQMC + CV + Antithetic & 0.000000 & 0.000045 \\
+\bottomrule
+\end{tabular}
