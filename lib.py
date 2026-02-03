@@ -8,8 +8,7 @@ import time
 
 
 class MonteCarloSimulation:
-    def __init__(self, S0, K, r, sigma, gamma, T, M, base_seed=42,
-                 *, safe_clip=True, clip_warn_once=True, S_max=1e7, log_exp_clip=15.0, pow_term_max=1e8):
+    def __init__(self, S0, K, r, sigma, gamma, T, M, base_seed=42):
         """Initialize Monte Carlo simulation parameters.
 
         Args:
@@ -21,11 +20,6 @@ class MonteCarloSimulation:
             T (float): Time to maturity
             M (int): Number of time steps
             base_seed (int, optional): Base seed for random number generation. Defaults to 42.
-            safe_clip (bool): whether to enable numeric clipping to avoid overflow
-            clip_warn_once (bool): emit a clipping warning at most once
-            S_max (float): maximum allowed simulated price for clipping
-            log_exp_clip (float): clip value for exponents used in pow calculations
-            pow_term_max (float|None): optional cap for pow-term values
         """
         self.S0 = S0
         self.K = K
@@ -37,19 +31,6 @@ class MonteCarloSimulation:
         self.base_seed = base_seed
         self.dt = T / M
         self.sqrt_dt = np.sqrt(self.dt)
-
-        # Numeric safety / clipping controls (tunable)
-        # safe_clip: enable clipping of extreme values to avoid overflow
-        # clip_warn_once: emit warning at most once per MonteCarloSimulation instance
-        self.safe_clip = bool(safe_clip)
-        self.clip_warn_once = bool(clip_warn_once)
-        self._clip_S_max = float(S_max)
-        self._clip_log_exp = float(log_exp_clip)
-        # Use None to disable direct pow-term capping
-        self._clip_pow_term_max = None if pow_term_max is None else float(pow_term_max)
-        # internal aggregated counters / flags
-        self._clip_warned = False
-        self._clip_total_count = 0
 
     def draw_pseudo_random_numbers(self, seed, N, M):
         """Generate pseudo-random standard normal variables."""
@@ -63,7 +44,10 @@ class MonteCarloSimulation:
             raise ValueError("For Sobol QMC, set N to 2**m.")
         sobol_engine = Sobol(d=M, scramble=True, seed=seed)
         U = sobol_engine.random_base2(m=m)
-        return norm.ppf(np.clip(U, 1e-12, 1-1e-12))
+        # Clip to avoid extreme quantiles that produce inf/-inf in norm.ppf
+        epsilon = 1e-10
+        U = np.clip(U, epsilon, 1.0 - epsilon)
+        return norm.ppf(U)
 
     @staticmethod
     def dyadic_midpoint_order(M):
@@ -97,6 +81,9 @@ class MonteCarloSimulation:
         construction (dyadic mid-point order). The mapping is vectorized over
         the N paths.
         """
+        # Clip epsilon to avoid extreme quantiles
+        epsilon = 1e-10
+        
         if use_antithetic:
             if N < 2:
                 raise ValueError("For antithetic pairing, N must be at least 2.")
@@ -108,7 +95,8 @@ class MonteCarloSimulation:
             sobol_engine = Sobol(d=M, scramble=True, seed=seed)
             U_half = sobol_engine.random_base2(m=m-1)
             U = np.vstack([U_half, 1.0 - U_half])
-            Z_std = norm.ppf(np.clip(U, 1e-12, 1-1e-12))
+            U = np.clip(U, epsilon, 1.0 - epsilon)
+            Z_std = norm.ppf(U)
         else:
             # Generate standard normal variates from scrambled Sobol; require N=2**m
             m = int(np.ceil(np.log2(N)))
@@ -116,7 +104,8 @@ class MonteCarloSimulation:
                 raise ValueError("For Sobol QMC, set N to 2**m.")
             sobol_engine = Sobol(d=M, scramble=True, seed=seed)
             U = sobol_engine.random_base2(m=m)
-            Z_std = norm.ppf(np.clip(U, 1e-12, 1-1e-12))  # shape (N, M)
+            U = np.clip(U, epsilon, 1.0 - epsilon)
+            Z_std = norm.ppf(U)  # shape (N, M)
 
         # Brownian-bridge mapping: map independent normals Z_std to samples of
         # W(t1..tM) in dyadic (midpoint) order then convert to increments dW
@@ -198,9 +187,13 @@ class MonteCarloSimulation:
 
         # Stack original and antithetic (1 - U) to form N samples
         U = np.vstack([U_half, 1.0 - U_half])
+        
+        # Clip to avoid extreme quantiles that produce inf/-inf in norm.ppf
+        epsilon = 1e-10
+        U = np.clip(U, epsilon, 1.0 - epsilon)
 
-        # Convert to standard normals; clip to avoid extreme tail issues
-        return norm.ppf(np.clip(U, 1e-12, 1-1e-12))
+        # Convert to standard normals
+        return norm.ppf(U)
 
     def _cev_arith_from_Z(self, Z, euler=False):
         N = Z.shape[0]
@@ -303,37 +296,19 @@ class MonteCarloSimulation:
         # Small floor to avoid taking powers of zero which can produce inf/nan
         S_floor = 1e-16
 
-        # Limits to keep simulated prices in a reasonable numeric range.
-        # Cap S to S_max (so logS <= LOGS_CLIP = log(S_max)).
-        # Use a conservative default S_MAX to prevent explosive power terms.
-        S_MAX = 1e7
-        LOGS_CLIP = float(np.log(S_MAX))  # ~9.21 for 1e4
-        # Clip exponent arguments to avoid huge pow_term values
-        LOG_EXP_CLIP = 15.0
-        # Also cap pow_term values directly
-        POW_TERM_MAX = 1e8
-        # optional counter (for debugging) - count how many updates were clipped
-        clipped_updates = 0
-
         for n in range(self.M):
             logS_n = logS[:, n]
-            S_n = np.exp(np.clip(logS_n, -LOGS_CLIP, LOGS_CLIP))
+            S_n = np.exp(logS_n)
             # apply floor to S_n for numerical stability in power operations
             S_n_safe = np.maximum(S_n, S_floor)
             dW = sqrt_dt * Z[:, n]
 
-            # compute powers in log-space and clip exponents to avoid overflow
+            # compute powers in log-space
             log_S_n_safe = np.log(S_n_safe)
             exp1 = (2.0 * self.gamma - 2.0) * log_S_n_safe
             exp2 = (self.gamma - 1.0) * log_S_n_safe
-            exp1_clipped = np.clip(exp1, -LOG_EXP_CLIP, LOG_EXP_CLIP)
-            exp2_clipped = np.clip(exp2, -LOG_EXP_CLIP, LOG_EXP_CLIP)
-            pow_term = np.exp(exp1_clipped)
-            pow_term_diff = np.exp(exp2_clipped)
-            # cap pow terms to avoid gigantic drift/correction
-            if POW_TERM_MAX is not None:
-                pow_term = np.minimum(pow_term, POW_TERM_MAX)
-                pow_term_diff = np.minimum(pow_term_diff, POW_TERM_MAX)
+            pow_term = np.exp(exp1)
+            pow_term_diff = np.exp(exp2)
 
             drift = (self.r - 0.5 * self.sigma**2 * pow_term) * dt
             diffusion = self.sigma * pow_term_diff * dW
@@ -344,19 +319,7 @@ class MonteCarloSimulation:
                 correction = 0.5 * self.sigma**2 * (self.gamma - 1.0) * pow_term * (dW**2 - dt)
                 logS_next = logS_n + drift + diffusion + correction
 
-            # Clip updated logS to reasonable finite range to prevent overflow in np.exp
-            logS_clipped = np.clip(logS_next, -LOGS_CLIP, LOGS_CLIP)
-            # track whether clipping occurred (useful to debug unstable params)
-            clipped_updates += int(np.sum(logS_clipped != logS_next))
-            logS[:, n+1] = logS_clipped
-
-        if clipped_updates > 0:
-            # small, non-intrusive warning for debugging; avoid noisy prints in normal runs
-            try:
-                import warnings
-                warnings.warn(f"sim_CEV_paths: clipped {clipped_updates} logS updates to keep values numeric", RuntimeWarning)
-            except Exception:
-                pass
+            logS[:, n+1] = logS_next
             
         return np.exp(logS)
 
@@ -396,30 +359,18 @@ class MonteCarloSimulation:
         # Small floor to avoid taking powers of zero
         S_floor = 1e-16
 
-        # Limits for exponent to avoid overflow from np.exp
-        S_MAX = 1e5
-        LOGS_CLIP = float(np.log(S_MAX))
-        LOG_EXP_CLIP = 15.0
-        POW_TERM_MAX = 1e8
-
         for n in range(self.M):
             logS_n = logS[:, n]
-            S_n = np.exp(np.clip(logS_n, -LOGS_CLIP, LOGS_CLIP))
+            S_n = np.exp(logS_n)
             S_n_safe = np.maximum(S_n, S_floor)
             dW = sqrt_dt * Z[:, n]
 
-            # compute powers in log-space and clip exponents
+            # compute powers in log-space
             log_S_n_safe = np.log(S_n_safe)
             exp1 = (2.0 * self.gamma - 2.0) * log_S_n_safe
             exp2 = (self.gamma - 1.0) * log_S_n_safe
-            exp1_clipped = np.clip(exp1, -LOG_EXP_CLIP, LOG_EXP_CLIP)
-            exp2_clipped = np.clip(exp2, -LOG_EXP_CLIP, LOG_EXP_CLIP)
-            pow_term = np.exp(exp1_clipped)
-            pow_term_diff = np.exp(exp2_clipped)
-            # cap pow terms to avoid gigantic drift/correction
-            if POW_TERM_MAX is not None:
-                pow_term = np.minimum(pow_term, POW_TERM_MAX)
-                pow_term_diff = np.minimum(pow_term_diff, POW_TERM_MAX)
+            pow_term = np.exp(exp1)
+            pow_term_diff = np.exp(exp2)
 
             drift = (self.r - 0.5 * sigma**2 * pow_term) * dt
             diffusion = sigma * pow_term_diff * dW
@@ -430,7 +381,7 @@ class MonteCarloSimulation:
                 correction = 0.5 * sigma**2 * (self.gamma - 1.0) * pow_term * (dW**2 - dt)
                 logS_next = logS_n + drift + diffusion + correction
 
-            logS[:, n+1] = np.clip(logS_next, -LOGS_CLIP, LOGS_CLIP)
+            logS[:, n+1] = logS_next
 
         S = np.exp(logS)
         arith_avg = S[:, 1:].mean(axis=1)
