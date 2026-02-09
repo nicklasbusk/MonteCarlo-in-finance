@@ -1,7 +1,5 @@
-# This is a Python library for Monte Carlo simulations in pricing an Asian option.
 import numpy as np
 import matplotlib.pyplot as plt
-#import qmcpy as qp
 from scipy.stats.qmc import Sobol
 from scipy.stats import norm, t
 import time
@@ -9,18 +7,6 @@ import time
 
 class MonteCarloSimulation:
     def __init__(self, S0, K, r, sigma, gamma, T, M, base_seed=42):
-        """Initialize Monte Carlo simulation parameters.
-
-        Args:
-            S0 (float): Initial stock price
-            K (float): Strike price
-            r (float): Risk-free rate/ Mu
-            sigma (float): Volatility parameter
-            gamma (float): CEV model parameter
-            T (float): Time to maturity
-            M (int): Number of time steps
-            base_seed (int, optional): Base seed for random number generation. Defaults to 42.
-        """
         self.S0 = S0
         self.K = K
         self.r = r
@@ -52,7 +38,6 @@ class MonteCarloSimulation:
     @staticmethod
     def dyadic_midpoint_order(M):
         """Return dyadic midpoint sampling order (exclude endpoints 0 and M).
-
         This reproduces the order produced by the recursive midpoint splitting
         used for Brownian-bridge constructions: visit a segment, record its
         midpoint, then recurse left then right.
@@ -78,8 +63,7 @@ class MonteCarloSimulation:
         in the existing simulation routines where dW = sqrt(dt) * Z[:, n]).
 
         The routine takes Sobol points -> normal variates -> Brownian bridge
-        construction (dyadic mid-point order). The mapping is vectorized over
-        the N paths.
+        construction. The mapping is vectorized over the N paths.
         """
         # Clip epsilon to avoid extreme quantiles
         epsilon = 1e-10
@@ -90,7 +74,6 @@ class MonteCarloSimulation:
 
             # Generate half the Sobol points and stack their antithetic complements.
             m = int(np.ceil(np.log2(N)))
-            half = N // 2
             # Use m-1 to generate half = 2**(m-1) Sobol points
             sobol_engine = Sobol(d=M, scramble=True, seed=seed)
             U_half = sobol_engine.random_base2(m=m-1)
@@ -113,10 +96,6 @@ class MonteCarloSimulation:
         dt = self.dt
         sqrt_dt = self.sqrt_dt
         Mloc = M
-
-        # times are at multiples of dt: t_i = i*dt for i=1..M
-        # We'll work with indices 0..M (0 = time 0, M = time T). The sampled
-        # values array has length M+1, with known W(0)=0 and W(T) from Z_std[:,0].
 
         # Build dyadic midpoint sampling order (excluding endpoints)
         order = self.dyadic_midpoint_order(Mloc)
@@ -174,13 +153,12 @@ class MonteCarloSimulation:
         to be a power of two and N >= 2.
         """
         if N < 2:
-            raise ValueError("For antithetic pairing, N must be at least 2.")
+            raise ValueError("N must be at least 2.")
 
         m = int(np.ceil(np.log2(N)))
         if 2**m != N:
-            raise ValueError("For Sobol QMC, set N to 2**m.")
+            raise ValueError("set N to 2**m.")
 
-        half = N // 2
         # Use m-1 to generate half = 2**(m-1) Sobol points
         sobol_engine = Sobol(d=M, scramble=True, seed=seed)
         U_half = sobol_engine.random_base2(m=m-1)
@@ -231,59 +209,7 @@ class MonteCarloSimulation:
         undiscounted = np.exp(m + 0.5*v) * norm.cdf(d1) - self.K * norm.cdf(d2)
         return float(np.exp(-self.r*self.T) * undiscounted)
 
-    def geometric_asian_closed_form_sigma(self, sigma_val):
-        """Closed-form geometric Asian price for a given sigma (helper)."""
-        m = np.log(self.S0) + (self.r - 0.5 * sigma_val**2) * self.T * (self.M + 1) / (2 * self.M)
-        v = (sigma_val**2) * self.T * ((self.M + 1) * (2 * self.M + 1)) / (6 * self.M**2)
-        s = np.sqrt(max(v, 0.0))
-        if s == 0.0:
-            G = np.exp(m)
-            return float(np.exp(-self.r*self.T) * max(G - self.K, 0.0))
-        d1 = (m - np.log(self.K) + v) / s
-        d2 = d1 - s
-        undiscounted = np.exp(m + 0.5*v) * norm.cdf(d1) - self.K * norm.cdf(d2)
-        return float(np.exp(-self.r*self.T) * undiscounted)
-
-    def geometric_asian_delta_closed_form(self):
-        """Closed-form expected geometric-Asian Delta (dPrice/dS0) under GBM.
-
-        Derived by differentiating the closed-form geometric Asian price w.r.t. S0.
-        """
-        # reuse same symbols as geometric_asian_closed_form
-        m_const = (self.r - 0.5 * self.sigma**2) * self.T * (self.M + 1) / (2 * self.M)
-        m = np.log(self.S0) + m_const
-        v = (self.sigma**2) * self.T * ((self.M + 1) * (2 * self.M + 1)) / (6 * self.M**2)
-        s = np.sqrt(max(v, 0.0))
-        if s == 0.0:
-            G = np.exp(m)
-            return float(np.exp(-self.r*self.T) * (G > self.K) * (G / self.S0))
-
-        A = np.exp(m + 0.5 * v)
-        d1 = (m - np.log(self.K) + v) / s
-        d2 = d1 - s
-
-        # derivatives
-        dm_dS0 = 1.0 / self.S0
-        dA_dS0 = A * dm_dS0
-        dd1_dS0 = dm_dS0 / s
-
-        term1 = dA_dS0 * norm.cdf(d1)
-        term2 = A * norm.pdf(d1) * dd1_dS0
-        term3 = - self.K * norm.pdf(d2) * dd1_dS0
-
-        undiscounted_deriv = term1 + term2 + term3
-        return float(np.exp(-self.r * self.T) * undiscounted_deriv)
-
-    def geometric_asian_vega_closed_form(self, rel_eps=1e-6):
-        """Estimate closed-form geometric-Asian Vega by central finite-difference
-        of the closed-form price with respect to sigma. This is fast and
-        numerically stable for the small eps used here.
-        """
-        eps = max(rel_eps * max(1.0, abs(self.sigma)), 1e-8)
-        p_plus = self.geometric_asian_closed_form_sigma(self.sigma + eps)
-        p_minus = self.geometric_asian_closed_form_sigma(self.sigma - eps)
-        return float((p_plus - p_minus) / (2.0 * eps))
-
+  
     def sim_CEV_paths(self, N, Z, euler=False):
         """Simulate CEV model paths."""
         # Recompute dt/sqrt_dt in case self.M was changed externally
@@ -351,7 +277,6 @@ class MonteCarloSimulation:
         # Simulate paths with local params (copy of sim_CEV_paths using overrides)
         logS = np.empty((N, self.M+1), dtype=float)
         logS[:, 0] = np.log(S0)
-
         # Recompute dt/sqrt_dt in case self.M was changed externally
         dt = self.T / self.M
         sqrt_dt = np.sqrt(dt)
@@ -553,70 +478,26 @@ class MonteCarloSimulation:
                 estimates.append(self.price_asian_option_cv_from_Z(Z, euler, beta_fixed=None))
         return self.ci_from_replicates(estimates)
     
-    def rqmc_with_antithetic(self, N, batches, euler=False, CV=False):
-        """Run MC with antithetic variates."""
-        estimates = []
-        for b in range(batches):
-            Z = self.draw_quasi_antithetic_numbers(self.base_seed + b, N, self.M)
-            if not CV:    
-                estimates.append(self.price_asian_option_from_Z(Z, euler))
-            else:
-                estimates.append(self.price_asian_option_cv_from_Z(Z, euler, beta_fixed=None))
-        return self.ci_from_replicates(estimates)
-
-    def mc_with_antithetic_cv_pairavg(self, N, batches, euler=False): #Dont get used?
-        estimates = []
-        muY = self.geometric_asian_closed_form()
-        for b in range(batches):
-            # Generate explicit pairs
-            Z1 = self.draw_pseudo_random_numbers(self.base_seed + b, N//2, self.M)
-            Z2 = -Z1
-
-            X1 = self._cev_arith_from_Z(Z1, euler)
-            X2 = self._cev_arith_from_Z(Z2, euler)
-            Y1 = self.sim_GBM_paths(Z1.shape[0], Z1)
-            Y2 = self.sim_GBM_paths(Z2.shape[0], Z2)
-
-            # Pair-average
-            Xp = 0.5*(X1 + X2)
-            Yp = 0.5*(Y1 + Y2)
-
-            # In-sample beta for MC
-            Xc, Yc = Xp - Xp.mean(), Yp - Yp.mean()
-            varY = Yc.var(ddof=1)
-            beta = 0.0 if varY == 0 else (np.cov(Xp, Yp, ddof=1)[0,1] / varY)
-
-            adj = Xp + beta*(muY - Yp)
-            estimates.append(float(adj.mean()))
-        return self.ci_from_replicates(estimates)
 
     def compare_methods(self, N, batches=8, euler=False):
         """Compare different Monte Carlo methods."""
         # Standard MC
         mc_mean, mc_se, mc_ci, mc_var = self.mc_with_batches(N, batches, euler)
-        
         # RQMC
         qmc_mean, qmc_se, qmc_ci, qmc_var = self.rqmc_with_scrambles(N, batches, euler)
-        
         # MC + Antithetic
         anti_mean, anti_se, anti_ci, anti_var = self.mc_with_antithetic(N, batches, euler)
-        
         # MC + CV
         mc_cv_mean, mc_cv_se, mc_cv_ci, mc_cv_var = self.mc_with_batches(N, batches, euler, CV=True)
-       
        # MC + CV + Antithetic
         mc_cv_anti_mean, mc_cv_anti_se, mc_cv_anti_ci, mc_cv_anti_var = self.mc_with_antithetic(N, batches, euler, CV=True)
 
-
         # RQMC + BB
         qmc_bb_mean, qmc_bb_se, qmc_bb_ci, qmc_bb_var = self.rqmc_with_scrambles(N, batches, euler, CV=False, use_antithetic=False, use_bb=True)
-
         # RQMC + BB + Antithetic
-        qmc_cv_mean, qmc_cv_se, qmc_cv_ci, qmc_cv_var = self.rqmc_with_scrambles(N, batches, euler, CV=False, use_antithetic=True, use_bb=True)
-        
+        qmc_cv_mean, qmc_cv_se, qmc_cv_ci, qmc_cv_var = self.rqmc_with_scrambles(N, batches, euler, CV=False, use_antithetic=True, use_bb=True) 
         # RQMC + BB + CV
         qmc_cv_bb_mean, qmc_cv_bb_se, qmc_cv_bb_ci, qmc_cv_bb_var = self.rqmc_with_scrambles(N, batches, euler, CV=True, use_antithetic=False, use_bb=True)
-
         # RQMC + BB + CV + Antithetic
         qmc_cv_anti_mean, qmc_cv_anti_se, qmc_cv_anti_ci, qmc_cv_anti_var = self.rqmc_with_scrambles(N, batches, euler, CV=True, use_antithetic=True, use_bb=True)
 
@@ -967,343 +848,3 @@ class MonteCarloSimulation:
         else:
             return prices_vega, errors_vega, cis_vega, times_vega
 
-
-def vrf_greek_vs_param(
-    base_params,
-    param_name: str,
-    param_values: list,
-    N: int,
-    n_batches: int,
-    greek: str = "delta",
-):
-    """
-    Compute variance reduction factor (VRF) for a Greek as a function of a single model parameter.
-
-    Args:
-        base_params: instance of MonteCarloSimulation (or dict-like with keys S0,K,r,sigma,gamma,T,M,base_seed)
-        param_name: one of 'sigma', 'gamma', 'T'
-        param_values: iterable of values to test
-        N: number of paths per batch / per scramble (for QMC must be power of 2 when used with Sobol)
-        n_batches: number of batches (MC) or scrambles (RQMC)
-        greek: 'delta' or 'vega'
-
-    Returns:
-        dict containing keys: 'param_values','var_cmc','var_rqmc','vrf','se_cmc','se_rqmc','greek','param_name'
-    """
-    allowed = {"sigma", "gamma", "T"}
-    if param_name not in allowed:
-        raise ValueError(f"param_name must be one of {allowed}")
-
-    # helper to construct a MonteCarloSimulation from base params
-    def make_sim_with_param(v):
-        if isinstance(base_params, MonteCarloSimulation):
-            b = base_params
-            S0 = b.S0
-            K = b.K
-            r = b.r
-            sigma = b.sigma
-            gamma = b.gamma
-            T = b.T
-            M = b.M
-            base_seed = getattr(b, "base_seed", 42)
-        else:
-            # assume dict-like
-            S0 = base_params.get("S0")
-            K = base_params.get("K")
-            r = base_params.get("r")
-            sigma = base_params.get("sigma")
-            gamma = base_params.get("gamma")
-            T = base_params.get("T")
-            M = base_params.get("M")
-            base_seed = base_params.get("base_seed", 42)
-
-        # replace the requested parameter
-        if param_name == "sigma":
-            sigma = float(v)
-        elif param_name == "gamma":
-            gamma = float(v)
-        elif param_name == "T":
-            T = float(v)
-
-        sim = MonteCarloSimulation(S0, K, r, sigma, gamma, T, M, base_seed=base_seed)
-        return sim
-
-    param_vals = list(param_values)
-    var_cmc_list = []
-    var_rqmc_list = []
-    vrf_list = []
-    se_cmc_list = []
-    se_rqmc_list = []
-
-    kind = greek.strip().lower()
-    if kind not in ("delta", "vega"):
-        raise ValueError("greek must be 'delta' or 'vega'")
-
-    for v in param_vals:
-        sim = make_sim_with_param(v)
-
-        # Run MC batches (standard MC) to obtain between-batch variance and SE
-        (d_mean_mc, d_se_mc, d_ci_mc, d_var_between_mc, d_repl_mc), (v_mean_mc, v_se_mc, v_ci_mc, v_var_between_mc, v_repl_mc) = sim.mc_greeks_with_batches(N, batches=n_batches, use_antithetic=True,CV=True)
-        
-        # Run RQMC scrambles (use Brownian bridge by default for good performance)
-        (d_mean_q, d_se_q, d_ci_q, d_var_between_q, d_repl_q), (v_mean_q, v_se_q, v_ci_q, v_var_between_q, v_repl_q) = sim.rqmc_greeks_with_scrambles(N, scrambles=n_batches, use_bb=True, CV=False)
-
-        if kind == "delta":
-            var_cmc = float(d_var_between_mc)
-            var_rqmc = float(d_var_between_q)
-            se_cmc = float(d_se_mc)
-            se_rqmc = float(d_se_q)
-        else:
-            var_cmc = float(v_var_between_mc)
-            var_rqmc = float(v_var_between_q)
-            se_cmc = float(v_se_mc)
-            se_rqmc = float(v_se_q)
-
-        vrf = float(var_cmc / var_rqmc) if (var_rqmc is not None and var_rqmc != 0 and np.isfinite(var_rqmc)) else float('nan')
-
-        var_cmc_list.append(var_cmc)
-        var_rqmc_list.append(var_rqmc)
-        vrf_list.append(vrf)
-        se_cmc_list.append(se_cmc)
-        se_rqmc_list.append(se_rqmc)
-
-    return {
-        "param_values": param_vals,
-        "var_cmc": var_cmc_list,
-        "var_rqmc": var_rqmc_list,
-        "vrf": vrf_list,
-        "se_cmc": se_cmc_list,
-        "se_rqmc": se_rqmc_list,
-        "greek": kind,
-        "param_name": param_name,
-    }
-
-
-def plot_vrf_vs_param(results: dict, title_prefix: str = "") -> None:
-    """
-    Plot VRF = var_cmc / var_rqmc versus parameter values.
-
-    Creates two vertical subplots:
-      - Top: VRF vs parameter
-      - Bottom: var_cmc and var_rqmc vs parameter (log-scale y)
-
-    Args:
-        results: dict returned by `vrf_greek_vs_param`.
-        title_prefix: optional prefix for the plot title.
-    """
-    # defensive extraction
-    x = np.asarray(results.get("param_values", []), dtype=float)
-    vrf = np.asarray(results.get("vrf", []), dtype=float)
-    var_cmc = np.asarray(results.get("var_cmc", []), dtype=float)
-    var_rqmc = np.asarray(results.get("var_rqmc", []), dtype=float)
-
-    param_name = results.get("param_name", "param")
-    greek = results.get("greek", "greek").capitalize()
-
-    # friendly x-label
-    x_label = param_name
-
-    plt.figure(figsize=(8, 8))
-
-    # Top: VRF
-    ax1 = plt.subplot(2, 1, 1)
-    ax1.plot(x, vrf, marker="o", linestyle="-", color="#1f77b4")
-    ax1.set_xlabel(x_label)
-    ax1.set_ylabel("VRF (var_cmc / var_rqmc)")
-    ax1.set_title(f"{title_prefix} {greek} - VRF vs {param_name}".strip())
-    ax1.grid(True)
-
-    # Bottom: variances
-    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    ax2.plot(x, var_cmc, marker="s", linestyle="-", label="var_cmc", color="#ff7f0e")
-    ax2.plot(x, var_rqmc, marker="d", linestyle="--", label="var_rqmc", color="#2ca02c")
-    ax2.set_xlabel(x_label)
-    ax2.set_ylabel("Between-replicate variance")
-    ax2.set_yscale("log")
-    ax2.legend()
-    ax2.grid(True, which="both", ls="--", lw=0.5)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def vrf_greek_vs_param_all(
-    base_params,
-    param_name: str,
-    param_values: list,
-    N: int,
-    n_batches: int,
-    greek: str = "delta",
-    methods: list = None,
-    rel_bump: float = 0.001,
-    abs_bump: float = 0.001,
-    scheme: str = "central",
-):
-    """
-    Compute VRF (variance reduction factor) for multiple Monte Carlo/RQMC setups
-    relative to standard CMC across a parameter sweep.
-
-    Args:
-        base_params: MonteCarloSimulation instance or dict-like params
-        param_name: one of 'sigma','gamma','T'
-        param_values: iterable of parameter values to test
-        N: number of points per batch/scramble
-        n_batches: number of batches (MC) or scrambles (RQMC)
-        greek: 'delta' or 'vega'
-        methods: list of method names to evaluate. If None, a sensible default is used.
-        rel_bump/abs_bump/scheme: forwarded to Greek estimators
-
-    Returns:
-        dict with keys: 'param_values','param_name','greek','methods','vars','ses','vrf_vs_cmc'
-    """
-    default_methods = [
-        'mc',
-        'mc + antithetic',
-        'mc + cv',
-        'mc + cv + antithetic',
-        'qmc + bb',
-        'qmc + bb + cv'
-    ]
-    if methods is None:
-        methods = default_methods
-
-    kind = greek.strip().lower()
-    if kind not in ("delta", "vega"):
-        raise ValueError("greek must be 'delta' or 'vega'")
-
-    # factory to make MonteCarloSimulation for each param value
-    def make_sim(v):
-        if isinstance(base_params, MonteCarloSimulation):
-            b = base_params
-            S0, K, r, sigma, gamma, T, M, base_seed = (
-                b.S0, b.K, b.r, b.sigma, b.gamma, b.T, b.M, getattr(b, 'base_seed', 42)
-            )
-        else:
-            S0 = base_params.get('S0')
-            K = base_params.get('K')
-            r = base_params.get('r')
-            sigma = base_params.get('sigma')
-            gamma = base_params.get('gamma')
-            T = base_params.get('T')
-            M = base_params.get('M')
-            base_seed = base_params.get('base_seed', 42)
-
-        if param_name == 'sigma':
-            sigma = float(v)
-        elif param_name == 'gamma':
-            gamma = float(v)
-        elif param_name == 'T':
-            T = float(v)
-        else:
-            raise ValueError("param_name must be one of 'sigma','gamma','T'")
-
-        return MonteCarloSimulation(S0, K, r, sigma, gamma, T, M, base_seed=base_seed)
-
-    param_vals = list(param_values)
-    methods_list = list(methods)
-
-    # prepare storage
-    vars_dict = {m: [] for m in methods_list}
-    ses_dict = {m: [] for m in methods_list}
-    vrf_dict = {m: [] for m in methods_list}
-
-    for v in param_vals:
-        sim = make_sim(v)
-
-        # compute baseline MC variance for this param value
-        # use mc_greeks_with_batches with CV/antithetic flags as appropriate for 'mc'
-        # but baseline is plain 'mc' (no CV, no antithetic)
-        (d_mean_mc, d_se_mc, d_ci_mc, d_var_between_mc, d_repl_mc), (v_mean_mc, v_se_mc, v_ci_mc, v_var_between_mc, v_repl_mc) = sim.mc_greeks_with_batches(N, batches=n_batches, use_antithetic=False, CV=False, rel_bump=rel_bump, abs_bump=abs_bump, scheme=scheme)
-
-        if kind == 'delta':
-            var_cmc = float(d_var_between_mc)
-            se_cmc = float(d_se_mc)
-        else:
-            var_cmc = float(v_var_between_mc)
-            se_cmc = float(v_se_mc)
-
-        # store baseline in dict under 'mc' if present
-        if 'mc' in vars_dict:
-            vars_dict['mc'].append(var_cmc)
-            ses_dict['mc'].append(se_cmc)
-            vrf_dict['mc'].append(1.0)
-
-        # now compute for each method
-        for m in methods_list:
-            # skip baseline, already recorded
-            if m == 'mc':
-                continue
-
-            # Map method string to call
-            m_low = m.lower()
-            try:
-                if m_low.startswith('mc'):
-                    use_ant = 'antithetic' in m_low
-                    use_cv = 'cv' in m_low
-                    (d_mean, d_se, d_ci, d_var_between, d_repl), (v_mean, v_se, v_ci, v_var_between, v_repl) = sim.mc_greeks_with_batches(N, batches=n_batches, use_antithetic=use_ant, CV=use_cv, rel_bump=rel_bump, abs_bump=abs_bump, scheme=scheme)
-                else:
-                    # treat as rqmc variant
-                    use_ant = 'antithetic' in m_low
-                    use_cv = 'cv' in m_low
-                    use_bb = 'bb' in m_low
-                    (d_mean, d_se, d_ci, d_var_between, d_repl), (v_mean, v_se, v_ci, v_var_between, v_repl) = sim.rqmc_greeks_with_scrambles(N, scrambles=n_batches, use_antithetic=use_ant, CV=use_cv, use_bb=use_bb, rel_bump=rel_bump, abs_bump=abs_bump, scheme=scheme)
-
-                if kind == 'delta':
-                    var_m = float(d_var_between)
-                    se_m = float(d_se)
-                else:
-                    var_m = float(v_var_between)
-                    se_m = float(v_se)
-
-            except Exception as exc:
-                # on error, append nan and continue
-                var_m = float('nan')
-                se_m = float('nan')
-
-            vars_dict[m].append(var_m)
-            ses_dict[m].append(se_m)
-
-            # VRF relative to CMC: var_cmc / var_m
-            if var_m == 0 or (not np.isfinite(var_m)):
-                vrf_val = float('nan')
-            else:
-                vrf_val = float(var_cmc / var_m)
-            vrf_dict[m].append(vrf_val)
-
-    return {
-        'param_values': param_vals,
-        'param_name': param_name,
-        'greek': kind,
-        'methods': methods_list,
-        'vars': vars_dict,
-        'ses': ses_dict,
-        'vrf_vs_cmc': vrf_dict,
-    }
-
-
-def plot_vrf_vs_param_methods(results: dict, title_prefix: str = "") -> None:
-    """
-    Plot VRF vs parameter for multiple methods (lines per method).
-
-    Args:
-        results: output from `vrf_greek_vs_param_all`
-        title_prefix: optional title prefix
-    """
-    x = np.asarray(results.get('param_values', []), dtype=float)
-    methods = results.get('methods', [])
-    vrf = results.get('vrf_vs_cmc', {})
-    param_name = results.get('param_name', 'param')
-    greek = results.get('greek', '').capitalize()
-
-    plt.figure(figsize=(8, 5))
-    for m in methods:
-        y = np.asarray(vrf.get(m, []), dtype=float)
-        plt.plot(x, y, marker='o', linestyle='-', label=m)
-
-    plt.xlabel(param_name)
-    plt.ylabel('VRF (var_cmc / var_method)')
-    plt.title(f"{title_prefix} {greek} - VRF vs {param_name}".strip())
-    plt.grid(True)
-    plt.legend(loc='best')
-    plt.tight_layout()
-    plt.show()
