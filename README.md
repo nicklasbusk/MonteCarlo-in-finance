@@ -8,7 +8,7 @@ The project studies the pricing of an **arithmetic Asian call option** under the
 
 The main comparison is between **Crude Monte Carlo (CMC)** and **Randomized Quasi-Monte Carlo (RQMC)** using scrambled Sobol' sequences. We also investigate Brownian bridge construction, control variates, antithetic variates, Euler-Maruyama and Milstein discretization, and finite-difference estimation of Delta and Vega.
 
-**Grade:** 10/12 on the Danish 7-point grading scale.
+**Grade:** 10 on the Danish 7-point grading scale.
 
 ## Main Findings
 
